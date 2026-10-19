@@ -1,4 +1,4 @@
-"""Free offline speech and language service. No cloud API or credentials."""
+"""MadCut speech and language service with Sarvam-powered captions."""
 from __future__ import annotations
 import asyncio
 import hashlib
@@ -11,6 +11,7 @@ import re
 import secrets
 import subprocess
 import time
+import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -20,12 +21,14 @@ from tempfile import NamedTemporaryFile
 os.environ['HF_HUB_OFFLINE']='1'
 os.environ['HF_HUB_DISABLE_TELEMETRY']='1'
 from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
 import uvicorn
 import spelling_profile
 import transcript_correction
+from sarvam_transcription import recognize as sarvam_recognize, configured as sarvam_configured
 from caption_flow import prepare as prepare_flow,options as flow_options,valid_words as valid_flow_words
 from chat_spelling import hint as spelling_hint
 from timed_subtitles import subtitle_result, fast_tenglish
@@ -34,17 +37,55 @@ from speech_recovery import recover_gaps,POLICY as RECOVERY_POLICY
 from caption_timing import faithful as faithful_tenglish, speech_words as mapped_speech_words, safe_tenglish, polish_tenglish, canonical_tenglish
 
 ROOT=Path(__file__).resolve().parent.parent
-CONFIG=json.loads((ROOT/'.local/config.json').read_text(encoding='utf-8-sig'))
+config_path=ROOT/'.local/config.json'
+CONFIG=json.loads(config_path.read_text(encoding='utf-8-sig')) if config_path.is_file() else {
+    'transcription_provider':'sarvam',
+    'ffprobe_executable':'ffprobe',
+    'ffmpeg_executable':'ffmpeg',
+    'model_name':'Sarvam Saaras v4',
+}
+if os.environ.get('TRANSCRIPTION_PROVIDER'): CONFIG['transcription_provider']=os.environ['TRANSCRIPTION_PROVIDER']
 MODEL_NAME=CONFIG.get('model_name','Qwen3-8B')+' · local'
 LLM_URL='http://127.0.0.1:8766'
 TRANSLATOR_URL='http://127.0.0.1:8767'
 LOCAL_TOKEN=secrets.token_urlsafe(32)
+DIAGNOSTIC_LOG=ROOT/'.local/logs/transcription-jobs.jsonl'
 jobs:dict[str,dict]={}
 pool=ThreadPoolExecutor(max_workers=1)
 llama:subprocess.Popen|None=None
 translator:subprocess.Popen|None=None
 languages={'Telugu','Tenglish','Hindi','Hinglish','English'}
 tones={'Accurate','WhatsApp','Casual','Social Media','Cinematic','Professional'}
+
+def diagnostic(job,phase,**fields):
+    """Structured local-only operational evidence; never includes media text."""
+    record={'at':round(time.time(),3),'jobId':job.get('id'),'phase':phase,'elapsedSeconds':round(time.perf_counter()-job.get('startedAt',time.perf_counter()),3),**fields}
+    DIAGNOSTIC_LOG.parent.mkdir(parents=True,exist_ok=True)
+    with DIAGNOSTIC_LOG.open('a',encoding='utf-8') as handle:handle.write(json.dumps(record,ensure_ascii=False)+'\n')
+MEDIA_SUFFIXES={'.mp3','.wav','.m4a','.aac','.flac','.ogg','.webm','.mp4','.mov','.mkv'}
+MAX_MEDIA_BYTES=200*1024*1024
+MAX_MEDIA_SECONDS=60*60
+
+def probe_media(path:Path):
+    """Reject invalid/no-audio uploads before an ASR job occupies the worker."""
+    ffprobe=CONFIG.get('ffprobe_executable') or 'ffprobe'
+    command=[ffprobe,'-v','error','-show_entries','format=duration:stream=codec_type,width,height','-of','json',str(path)]
+    try:
+        result=subprocess.run(command,capture_output=True,text=True,timeout=15,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+    except (OSError,subprocess.TimeoutExpired):
+        raise HTTPException(503,'Media inspection is unavailable. Check that FFmpeg is installed and try again.')
+    if result.returncode:
+        raise HTTPException(400,'This media cannot be read. Choose a valid audio or video file.')
+    try:
+        details=json.loads(result.stdout);duration=float(details.get('format',{}).get('duration',0));streams=details.get('streams',[])
+    except (TypeError,ValueError,json.JSONDecodeError):
+        raise HTTPException(400,'This media has no readable duration or streams.')
+    if not duration or duration <= 0 or duration > MAX_MEDIA_SECONDS:
+        raise HTTPException(400,'Choose media between 1 second and 60 minutes long.')
+    if not any(stream.get('codec_type')=='audio' for stream in streams):
+        raise HTTPException(400,'This video has no audio track. Add audio or upload an audio file to generate captions.')
+    video=next((stream for stream in streams if stream.get('codec_type')=='video'),None)
+    return {'duration':duration,'hasVideo':bool(video),'width':video.get('width') if video else None,'height':video.get('height') if video else None}
 
 def language_ready(url=LLM_URL):
     try:
@@ -119,9 +160,16 @@ async def lifespan(app):
     pool.shutdown(wait=False,cancel_futures=True)
 
 app=FastAPI(lifespan=lifespan,docs_url=None,redoc_url=None,openapi_url=None)
+if os.environ.get('MADCUT_PUBLIC','').lower() in {'1','true','yes'}:
+    allowed=[item.strip() for item in os.environ.get('MADCUT_CORS_ORIGINS','').split(',') if item.strip()]
+    app.add_middleware(CORSMiddleware,allow_origins=allowed or ['*'],allow_credentials=False,allow_methods=['*'],allow_headers=['*'])
 
 @app.middleware('http')
 async def local_boundary(request:Request,call_next):
+    if os.environ.get('MADCUT_PUBLIC','').lower() in {'1','true','yes'}:
+        response=await call_next(request)
+        if request.url.path.startswith('/api/'): response.headers['Cache-Control']='no-store'
+        return response
     host=request.headers.get('host','').split(':')[0]
     origin=request.headers.get('origin')
     if host not in {'127.0.0.1','localhost','testserver'}:
@@ -137,7 +185,11 @@ async def local_boundary(request:Request,call_next):
 def health():
     stt_ready=Path(CONFIG['whisper_model'],'model.bin').is_file() and (not CONFIG.get('telugu_speech_model') or Path(CONFIG['telugu_speech_model'],'model.bin').is_file())
     llm_ready=bool(llama and llama.poll() is None) and language_ready() and (not CONFIG.get('translation_model') or language_ready(TRANSLATOR_URL))
-    return {'configured':stt_ready,'local':True,'speech':CONFIG.get('speech_name','Whisper large-v3')+' · local','languageEngine':MODEL_NAME,'fastCaptions':True,'speechReady':stt_ready,'languageReady':llm_ready,'cost':'No API fees','offline':True}
+    provider=CONFIG.get('transcription_provider','local')
+    cloud=provider=='sarvam'
+    provider_ready=sarvam_configured() if cloud else stt_ready
+    speech_name='Sarvam Saaras v4' if cloud else CONFIG.get('speech_name','Whisper large-v3')+' · local'
+    return {'configured':provider_ready,'local':not cloud,'speech':speech_name,'languageEngine':MODEL_NAME,'fastCaptions':True,'speechReady':provider_ready,'languageReady':llm_ready,'cost':'API billed' if cloud else 'No API fees','offline':not cloud,'transcriptionProvider':provider}
 
 def cleanup_jobs():
     cutoff=time.time()-3600
@@ -150,12 +202,14 @@ def submit(operation):
         raise HTTPException(429,'The local AI is busy. Wait for the current video to finish.')
     jid=str(uuid.uuid4())
     jobs[jid]={'id':jid,'status':'queued','message':'Waiting for the local AI…','created':time.time()}
+    diagnostic(jobs[jid],'queued')
     def execute():
-        job=jobs[jid];job.update(status='running')
-        try:job.update(status='complete',result=operation(job),message='Ready')
+        job=jobs[jid];job.update(status='running',startedAt=time.perf_counter());diagnostic(job,'worker-started')
+        try:
+            result=operation(job);job.update(status='complete',result=result,message='Ready');diagnostic(job,'succeeded',captions=len(result.get('cues',[])) if isinstance(result,dict) else None)
         except Exception as exc:
             message=str(exc) or 'Local AI processing failed.'
-            job.update(status='failed',error=message,message=message)
+            job.update(status='failed',error=message,message=message);diagnostic(job,'failed',error=message,traceback=traceback.format_exc(limit=12))
     pool.submit(execute)
     return {'jobId':jid}
 
@@ -165,16 +219,22 @@ def get_job(jid:str):
     return jobs[jid]
 
 CACHE=ROOT/'.local/speech-cache'
-PIPELINE_VERSION='progressive-v13-word-vad-flow'
+PIPELINE_VERSION='progressive-v15-sarvam-media'
 
 def recognition_key(path,language,terms):
     digest=hashlib.sha256()
-    digest.update(json.dumps([PIPELINE_VERSION,language,terms,[(str(p),p.stat().st_size,p.stat().st_mtime_ns) for p in [Path(CONFIG['whisper_model'])/'model.bin',Path(CONFIG.get('telugu_speech_model',CONFIG['whisper_model']))/'model.bin']]],ensure_ascii=False).encode())
+    provider=CONFIG.get('transcription_provider','local')
+    models=[Path(CONFIG['whisper_model'])/'model.bin',Path(CONFIG.get('telugu_speech_model',CONFIG['whisper_model']))/'model.bin']
+    if language=='te' and CONFIG.get('cpu_speech_model'):models.append(Path(CONFIG['cpu_speech_model'])/'model.bin')
+    # Recognition output is provider-specific. A cloud request must never
+    # silently replay a result produced by a local Whisper model (or vice versa).
+    model_identity='saaras:v4' if provider=='sarvam' else [(str(p),p.stat().st_size,p.stat().st_mtime_ns) for p in models]
+    digest.update(json.dumps([PIPELINE_VERSION,provider,model_identity,language,terms],ensure_ascii=False).encode())
     with path.open('rb') as handle:
         for block in iter(lambda:handle.read(1048576),b''):digest.update(block)
     return digest.hexdigest()
 
-def speech_request_worker(request,on_progress=None):
+def speech_request_worker(request,on_progress=None,on_trace=None):
     global speech_process,speech_messages
     if speech_process is None or speech_process.poll() is not None:
         messages=queue.Queue();speech_messages=messages
@@ -195,6 +255,9 @@ def speech_request_worker(request,on_progress=None):
         except queue.Empty:stop_speech_engine();raise ValueError('Speech recognition timed out. Use a shorter clip.')
         if line is None:stop_speech_engine();raise ValueError('The speech model stopped. Close other large applications and try again.')
         response=json.loads(line)
+        if response.get('event')=='trace':
+            if on_trace:on_trace(response)
+            continue
         if response.get('event')=='progress':
             if on_progress:on_progress(response)
             continue
@@ -205,7 +268,7 @@ def speech_request_worker(request,on_progress=None):
 
 def transcribe(audio_path:Path,language:str,job:dict,terms:str='',alignment=None,tenglish_mode='Natural',emojis=False,settings=None):
     settings=flow_options(settings)
-    started=time.perf_counter();cached=False;correction_memo={};streaming_stats=[]
+    started=time.perf_counter();cached=False;correction_memo={};streaming_stats=[];provider=CONFIG.get('transcription_provider','local')
     try:
         raw=None;cache_path=None
         if alignment is None:
@@ -239,7 +302,14 @@ def transcribe(audio_path:Path,language:str,job:dict,terms:str='',alignment=None
                 # Deeper correction runs once after acoustic recognition. Do
                 # not delay progressive speech captions by loading an LLM on
                 # every window or competing with ASR for GPU memory.
-            raw=speech_request_worker({'path':str(audio_path),'language':language,'terms':terms,'alignment':alignment,'stream':alignment is None},publish)
+            def trace(event):
+                phase=event.pop('phase','worker-trace');event.pop('event',None);event.pop('jobId',None)
+                diagnostic(job,phase,**event)
+            if provider=='sarvam' and alignment is None:
+                raw=sarvam_recognize(audio_path,language,terms,trace)
+            else:
+                raw=speech_request_worker({'path':str(audio_path),'language':language,'terms':terms,'alignment':alignment,'stream':alignment is None,'jobId':job['id']},publish,trace)
+            diagnostic(job,'acoustic-result-received',audioDuration=raw.get('duration'),captions=len(raw.get('cues',[])))
 
             if cache_path:
                 temp=cache_path.with_suffix('.tmp');temp.write_text(json.dumps(raw,ensure_ascii=False),encoding='utf-8');os.replace(temp,cache_path)
@@ -251,7 +321,7 @@ def transcribe(audio_path:Path,language:str,job:dict,terms:str='',alignment=None
         snapshot=RecognitionSnapshot.capture(raw,PIPELINE_VERSION) if alignment is None else None
         raw['cues']=source_cues(raw['cues'])
         attempts=[]
-        if snapshot and raw['language']=='te':
+        if snapshot and raw['language']=='te' and provider!='sarvam':
             _,coverage=prepare_flow(raw['cues'],raw['duration'],raw.get('speechSpans',[]),settings)
             if coverage['uncoveredSpeech']:
                 job.update(stage='checking-speech-coverage',progress=96,message='Checking a possible speech gap; original captions are retained…')
@@ -277,8 +347,19 @@ def transcribe(audio_path:Path,language:str,job:dict,terms:str='',alignment=None
             raw['cues']=transcript_correction.correct(raw['cues'],terms,memo=correction_memo)
             record_pids()
         if alignment is None:raw['cues'],raw['timelineQuality']=prepare_flow(raw['cues'],raw['duration'],raw.get('speechSpans',[]),settings)
+        diagnostic(job,'caption-grouping-completed',captions=len(raw['cues']))
         job.update(stage='generating-tenglish' if raw['language']=='te' else 'formatting',progress=98,message='Generating natural Tenglish…' if raw['language']=='te' else 'Preparing timed captions…')
         result=subtitle_result(raw,tenglish_mode,emojis)
+        # Keep provider provenance with the editor result. In particular,
+        # Saares may return a timestamped phrase rather than true word anchors.
+        # The existing formatter keeps the individual cues marked estimated;
+        # retaining this metadata prevents a saved project from implying otherwise.
+        result.update({key: deepcopy(raw[key]) for key in ('speechEngine','speechDevice','recognitionStats','rejectedRecognitionSegments','preprocessing') if key in raw})
+        if result.get('recognitionStats',{}).get('provider')=='sarvam':
+            # Caches created before timestampGranularity was added contained
+            # only the returned phrase span; retain that conservative meaning.
+            result['recognitionStats'].setdefault('timestampGranularity','chunk')
+        diagnostic(job,'normalization-completed',captions=len(result.get('cues',[])))
         if snapshot:
             result.update(rawTranscript=snapshot.export()['text'],provenance=provenance(snapshot,result['cues'],attempts))
             # Original coverage warnings remain visible even if text processing
@@ -293,6 +374,7 @@ def transcribe(audio_path:Path,language:str,job:dict,terms:str='',alignment=None
         job.update(progress=100,stage='ready')
         job.update(partial={**result,'preliminary':False},partialRevision=job.get('partialRevision',0)+1)
         result.update(cacheHit=cached,processingSeconds=round(time.perf_counter()-started,3),streamingStats=streaming_stats)
+        diagnostic(job,'results-persisted',cacheHit=cached,captions=len(result.get('cues',[])))
         return result
     finally:
         audio_path.unlink(missing_ok=True)
@@ -318,7 +400,7 @@ async def speech_request(file:UploadFile=File(...),language:str=Form('auto'),ter
     except (ValueError,TypeError):raise HTTPException(400,'Check caption timing settings.')
     if tenglishMode not in {'Natural','WhatsApp','Formal'}:raise HTTPException(400,'Choose a Tenglish mode.')
     if language not in {'auto','te','hi','en'}:raise HTTPException(400,'Choose a supported spoken language.')
-    if file.filename and Path(file.filename).suffix.lower() not in {'.mp3','.wav','.m4a','.webm','.mp4','.mov','.mkv'}:raise HTTPException(400,'Choose supported audio.')
+    if file.filename and Path(file.filename).suffix.lower() not in MEDIA_SUFFIXES:raise HTTPException(400,'Choose MP4, MOV, WebM, MKV, MP3, WAV, M4A, AAC, FLAC, or OGG media.')
     if len(terms)>1000:raise HTTPException(400,'Keep names and terms under 1,000 characters.')
     handle=NamedTemporaryFile(suffix=Path(file.filename or 'audio.wav').suffix or '.wav',delete=False,dir=ROOT/'.local')
     path=Path(handle.name)
@@ -326,11 +408,13 @@ async def speech_request(file:UploadFile=File(...),language:str=Form('auto'),ter
         count=0
         while data:=await file.read(1024*1024):
             count+=len(data)
-            if count>200*1024*1024:raise HTTPException(400,'Use media smaller than 200 MB.')
+            if count>MAX_MEDIA_BYTES:raise HTTPException(400,'Use media smaller than 200 MB.')
             handle.write(data)
         handle.close()
-        if not count:raise HTTPException(400,'The audio file is empty.')
-        return submit(lambda job:transcribe(path,language,job,terms,tenglish_mode=tenglishMode,emojis=emojis,settings=settings))
+        if not count:raise HTTPException(400,'The media file is empty.')
+        media=probe_media(path)
+        response=submit(lambda job:transcribe(path,language,job,terms,tenglish_mode=tenglishMode,emojis=emojis,settings=settings))
+        return {**response,'media':media}
     except Exception:
         handle.close();path.unlink(missing_ok=True);raise
     finally:await file.close()
@@ -538,4 +622,4 @@ async def trim_request(action:str,file:UploadFile=File(...),settings:str=Form(..
     finally:await file.close()
 
 app.mount('/',StaticFiles(directory=ROOT/'local-dist',html=True),name='studio')
-if __name__=='__main__':uvicorn.run(app,host='127.0.0.1',port=int(os.environ.get('CHATCUT_PORT','5173')),log_level='info',access_log=False)
+if __name__=='__main__':uvicorn.run(app,host='0.0.0.0' if os.environ.get('MADCUT_PUBLIC') else '127.0.0.1',port=int(os.environ.get('PORT',os.environ.get('CHATCUT_PORT','5173'))),log_level='info',access_log=False)

@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: madcut-api
+    runtime: docker
+    rootDir: outputs/chatcut
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: SARVAM_API_KEY
+        sync: false
+      - key: MADCUT_CORS_ORIGINS
+        sync: false
+      - key: TRANSCRIPTION_PROVIDER
+        value: sarvam
+      - key: MADCUT_PUBLIC
+        value: "1"
